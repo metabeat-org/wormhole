@@ -1,0 +1,205 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: guardian
+  labels:
+    app: guardian
+spec:
+  ports:
+    - port: 8999
+      name: p2p
+      protocol: UDP
+    - port: 7070
+      name: public-grpc
+      protocol: TCP
+    - port: 7071
+      name: public-rest
+      protocol: TCP
+  clusterIP: None
+  selector:
+    app: guardian
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: guardian
+spec:
+  selector:
+    matchLabels:
+      app: guardian
+  serviceName: guardian
+  replicas: 5
+  updateStrategy:
+    # The StatefulSet rolling update strategy is rather dumb, and updates one pod after another.
+    # If we want blue-green deployments, we should use a Deployment instead.
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: guardian
+    spec:
+      terminationGracePeriodSeconds: 0
+      volumes:
+        # mount shared between containers for runtime state
+        - name: node-rundir
+          emptyDir: {}
+        - name: node-bigtable-key
+          secret:
+            secretName: node-bigtable-key
+            optional: true
+            items:
+              - key: bigtable-key.json
+                path: bigtable-key.json
+        - name: node-wormchain-key
+          secret:
+            secretName: node-wormchain-key
+            optional: false
+            items:
+              - key: wormchainKey0
+                path: wormchainKey0
+              - key: wormchainKey1
+                path: wormchainKey1
+      containers:
+        - name: guardiand
+          image: guardiand-image
+          volumeMounts:
+            - mountPath: /run/node
+              name: node-rundir
+            - mountPath: /tmp/mounted-keys/bigtable
+              name: node-bigtable-key
+            - mountPath: /tmp/mounted-keys/wormchain
+              name: node-wormchain-key
+          command:
+            - /guardiand
+            - node
+            - --ethRPC
+            - ws://eth-devnet:8545
+            # - --bscRPC
+            # - ws://eth-devnet2:8545
+            - --polygonRPC
+            - ws://eth-devnet:8545
+            - --avalancheRPC
+            - ws://eth-devnet:8545
+            - --auroraRPC
+            - ws://eth-devnet:8545
+            - --fantomRPC
+            - ws://eth-devnet:8545
+            - --oasisRPC
+            - ws://eth-devnet:8545
+            - --karuraRPC
+            - ws://eth-devnet:8545
+            - --acalaRPC
+            - ws://eth-devnet:8545
+            - --klaytnRPC
+            - ws://eth-devnet:8545
+            - --celoRPC
+            - ws://eth-devnet:8545
+            - --moonbeamRPC
+            - ws://eth-devnet:8545
+            - --arbitrumRPC
+            - ws://eth-devnet:8545
+            - --optimismRPC
+            - ws://eth-devnet:8545
+            - --neonRPC
+            - ws://eth-devnet:8545
+            # - --wormchainWS
+            # - ws://wormchain:26657/websocket
+            # - --wormchainLCD
+            # - http://wormchain:1317
+            # - --wormchainURL
+            # - wormchain:9090
+            # - --wormchainKeyPath
+            # - /tmp/mounted-keys/wormchain/wormchainKey
+            # - --wormchainKeyPassPhrase
+            # - test0000
+            # - --accountantWS
+            # - http://wormchain:26657
+            # - --accountantContract
+            # - wormhole14hj2tavq8fpesdwxxcu44rty3hh90vhujrvcmstl4zr3txmfvw9srrg465
+            # - --accountantCheckEnabled=true
+            # - --terraWS
+            # - ws://terra-terrad:26657/websocket
+            # - --terraLCD
+            # - http://terra-terrad:1317
+            # - --terraContract
+            # - terra18vd8fpwxzck93qlwghaj6arh4p7c5n896xzem5
+            # - --terra2WS
+            # - ws://terra2-terrad:26657/websocket
+            # - --terra2LCD
+            # - http://terra2-terrad:1317
+            # - --terra2Contract
+            # - terra14hj2tavq8fpesdwxxcu44rty3hh90vhujrvcmstl4zr3txmfvw9ssrc8au
+            # - --algorandAppID
+            # - "4"
+            # - --algorandIndexerRPC
+            # - http://algorand:8980
+            # - --algorandIndexerToken
+            # - "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            # - --algorandAlgodRPC
+            # - http://algorand:4001
+            # - --algorandAlgodToken
+            # - "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            # - --nearRPC
+            # - http://near:3030
+            # - --nearContract
+            # - wormhole.test.near
+            - --solanaContract
+            - Bridge1p5gheXUvJ6jGWGeCsgPKgnE3YgdGKRVCMY9o
+            # - --solanaRPC
+            # - http://solana-devnet:8899
+            - --pythnetContract
+            - Bridge1p5gheXUvJ6jGWGeCsgPKgnE3YgdGKRVCMY9o
+            # - --pythnetRPC
+            # - http://solana-devnet:8899
+            - --unsafeDevMode
+            - --guardianKey
+            - /tmp/bridge.key
+            - --publicRPC
+            - "[::]:7070"
+            - --publicWeb
+            - "[::]:7071"
+            - --adminSocket
+            - /tmp/admin.sock
+            - --publicGRPCSocket
+            - /tmp/publicrpc.sock
+            - --dataDir
+            - /tmp/data
+            - --publicRpcLogDetail
+            - "full"
+          # - --chainGovernorEnabled=true
+          #            - --logLevel=debug
+          securityContext:
+            capabilities:
+              add:
+                # required for syscall.Mlockall
+                - IPC_LOCK
+          readinessProbe:
+            httpGet:
+              port: 6060
+              path: /readyz
+          ports:
+            - containerPort: 8999
+              name: p2p
+              protocol: UDP
+            - containerPort: 6060
+              name: pprof
+              protocol: TCP
+            - containerPort: 7070
+              name: public-grpc
+              protocol: TCP
+            - containerPort: 7071
+              name: public-grpcweb
+              protocol: TCP
+            - containerPort: 2345
+              name: debugger
+              protocol: TCP
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: node-wormchain-key
+type: Opaque
+data:
+  wormchainKey0: LS0tLS1CRUdJTiBURU5ERVJNSU5UIFBSSVZBVEUgS0VZLS0tLS0Ka2RmOiBiY3J5cHQKc2FsdDogNDc2ODc2NkE3OEZEN0ZBQjMwMUJGOTM5MUYwQ0Y2M0YKdHlwZTogc2VjcDI1NmsxCgpkbEZuN1ZqRk02RnJjYkdaVDRWeE5yRlE3SUhQS2RyVVBCRTYraW8yK0w0VFZqcis5emNIQTF3dzNubWtqNVFlCnVSekJWMjQyeUdTc3hNTTJZckI2Q1ZXdzlaWXJJY3JFeks1c0FuST0KPXB2aHkKLS0tLS1FTkQgVEVOREVSTUlOVCBQUklWQVRFIEtFWS0tLS0t
+  wormchainKey1: LS0tLS1CRUdJTiBURU5ERVJNSU5UIFBSSVZBVEUgS0VZLS0tLS0Ka2RmOiBiY3J5cHQKc2FsdDogNzc1M0NCQTBBMUQ0NTJCMkE2QzlERDM4ODc3MTg0NEEKdHlwZTogc2VjcDI1NmsxCgpSYnhRVWRnK2ZHcjMzZTAyVWFFQW1YTDFlNFkrTGJUMFdqbnl4RVR3OXBoL2JXOGI0MzdhWmErOWlCc3NBa0UyCnRScUwvb0J1NWFnQXJocHNnWUgxNlhOWjJHMXRwY0R3V0dQZ1VWVT0KPUd6YUwKLS0tLS1FTkQgVEVOREVSTUlOVCBQUklWQVRFIEtFWS0tLS0t
