@@ -8,27 +8,32 @@ to transfer tokens in or change configuration settings.
 The `WrappedAsset` is a ERC-20 token contract that holds metadata about a wormhole asset on ETH. Wormhole assets are all
 wrapped non-ETH assets that are currently held on ETH.
 
+### Building
+
+To build the contracts:
+`make build`
+
 ### Deploying
 
 To deploy the bridge on Ethereum you first need to compile all smart contracts:
 `npx truffle compile`
 
-To deploy you can either use the bytecode from the `build/contracts` folder or the oz cli `oz deploy <Contract>` 
+To deploy you can either use the bytecode from the `build/contracts` folder or the oz cli `oz deploy <Contract>`
 ([Documentation](https://docs.openzeppelin.com/learn/deploying-and-interacting)).
 
 You first need to deploy one `Wrapped Asset` and initialize it using dummy data.
 
 Then deploy the `Wormhole` using the initial guardian key (`key_x,y_parity,0`) and the address of the previously deployed
-`WrappedAsset`. The wrapped asset contract will be used as proxy library to all the creation of cheap proxy wrapped 
+`WrappedAsset`. The wrapped asset contract will be used as proxy library to all the creation of cheap proxy wrapped
 assets.
 
 ### Testing
 
 For each test run:
 
-Run `npx ganache-cli --deterministic --time "1970-01-01T00:00:00+00:00"` to start a chain.
+Run `npx ganache-cli --chain.vmErrorsOnRPCResponse --chain.chainId 1 --wallet.defaultBalance 10000 --wallet.deterministic --chain.time="1970-01-01T00:00:00+00:00" --chain.asyncRequestProcessing=false` to start a chain.
 
-Run the all ethereum tests using `make test`
+Run the all ethereum tests using `DEV=True make test`
 
 Run a specific test file using `npx truffle test test/wormhole.js`
 
@@ -57,13 +62,3 @@ wormhole/ethereum $ ../scripts/install-foundry
 ```
 
 The installer script installs foundry and the appropriate solc version to build the contracts.
-
-### Batched VAAs
-
-To send a transaction that will create multiple VAAs, invoke the `sendMultipleMessages` method of [ethereum/contracts/mock/MockBatchedVAASender.sol](./contracts/mock/MockBatchedVAASender.sol) with the truffle script:
-
-    npx truffle exec scripts/send_batched_vaa.js
-
-or invoke the same script in the tilt devnet:
-
-    minikube kubectl -- exec -n wormhole eth-devnet-0 -c tests --  npx truffle exec scripts/send_batched_vaa.js

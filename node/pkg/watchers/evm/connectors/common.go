@@ -10,9 +10,21 @@ import (
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/rpc"
 )
+
+type BlockMarshaller struct {
+	Number *hexutil.Big
+	Hash   common.Hash    `json:"hash"`
+	Time   hexutil.Uint64 `json:"timestamp"`
+
+	// L1BlockNumber is the L1 block number in which an Arbitrum batch containing this block was submitted.
+	// This field is only populated when connecting to Arbitrum.
+	L1BlockNumber *hexutil.Big
+}
 
 type NewBlock struct {
 	Number        *big.Int
@@ -33,13 +45,14 @@ type Connector interface {
 	ParseLogMessagePublished(log types.Log) (*ethabi.AbiLogMessagePublished, error)
 	SubscribeForBlocks(ctx context.Context, errC chan error, sink chan<- *NewBlock) (ethereum.Subscription, error)
 	RawCallContext(ctx context.Context, result interface{}, method string, args ...interface{}) error
+	RawBatchCallContext(ctx context.Context, b []rpc.BatchElem) error
 }
 
 type PollSubscription struct {
 	errOnce   sync.Once
-	err       chan error
-	quit      chan error
-	unsubDone chan struct{}
+	err       chan error    // subscription consumer reads, subscription fulfiller writes. used to propagate errors.
+	quit      chan error    // subscription consumer writes, subscription fulfiller reads. used to signal that consumer wants to cancel the subscription.
+	unsubDone chan struct{} // subscription consumer reads, subscription fulfiller writes. used to signal that the subscription was successfully canceled
 }
 
 func NewPollSubscription() *PollSubscription {
@@ -63,6 +76,6 @@ func (sub *PollSubscription) Unsubscribe() {
 			<-sub.unsubDone
 		case <-sub.unsubDone:
 		}
-		close(sub.err)
+		close(sub.err) // TODO FIXME this violates golang guidelines “Only the sender should close a channel, never the receiver. Sending on a closed channel will cause a panic.”
 	})
 }

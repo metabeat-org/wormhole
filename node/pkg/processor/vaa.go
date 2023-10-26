@@ -1,15 +1,14 @@
 package processor
 
 import (
-	"encoding/hex"
-
 	"github.com/wormhole-foundation/wormhole/sdk/vaa"
 	"go.uber.org/zap"
 )
 
 type VAA struct {
 	vaa.VAA
-	Unreliable bool
+	Unreliable    bool
+	Reobservation bool
 }
 
 func (v *VAA) HandleQuorum(sigs []*vaa.Signature, hash string, p *Processor) {
@@ -26,16 +25,10 @@ func (v *VAA) HandleQuorum(sigs []*vaa.Signature, hash string, p *Processor) {
 		Payload:          v.Payload,
 		ConsistencyLevel: v.ConsistencyLevel,
 	}
-	vaaBytes, err := signed.Marshal()
-	if err != nil {
-		panic(err)
-	}
 
 	// Store signed VAA in database.
 	p.logger.Info("signed VAA with quorum",
 		zap.String("digest", hash),
-		zap.Any("vaa", signed),
-		zap.String("bytes", hex.EncodeToString(vaaBytes)),
 		zap.String("message_id", signed.MessageID()))
 
 	if err := p.storeSignedVAA(signed); err != nil {
@@ -43,10 +36,13 @@ func (v *VAA) HandleQuorum(sigs []*vaa.Signature, hash string, p *Processor) {
 	}
 
 	p.broadcastSignedVAA(signed)
-	p.attestationEvents.ReportVAAQuorum(signed)
 	p.state.signatures[hash].submitted = true
 }
 
 func (v *VAA) IsReliable() bool {
 	return !v.Unreliable
+}
+
+func (v *VAA) IsReobservation() bool {
+	return v.Reobservation
 }

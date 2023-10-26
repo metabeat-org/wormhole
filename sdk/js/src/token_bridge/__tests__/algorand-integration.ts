@@ -56,10 +56,10 @@ import {
   ETH_PRIVATE_KEY7,
   TEST_ERC20,
   WORMHOLE_RPC_HOSTS,
-} from "./consts";
+} from "./utils/consts";
 
-const CORE_ID = BigInt(4);
-const TOKEN_BRIDGE_ID = BigInt(6);
+const CORE_ID = BigInt(1004);
+const TOKEN_BRIDGE_ID = BigInt(1006);
 
 jest.setTimeout(60000);
 
@@ -976,7 +976,7 @@ describe("Algorand tests", () => {
         const algoWallet: Account = tempAccts[0];
 
         const Fee: number = 0;
-        var testapp: number = 8;
+        var testapp: number = 1008;
         var dest = utils
           .hexZeroPad(BigNumber.from(testapp).toHexString(), 32)
           .substring(2);

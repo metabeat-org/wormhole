@@ -1,9 +1,10 @@
 require("dotenv").config({ path: ".env" });
 const HDWalletProvider = require("@truffle/hdwallet-provider");
 const KLAYHDWalletProvider = require("truffle-hdwallet-provider-klaytn");
-const Caver = require("caver-js");
 
 module.exports = {
+  contracts_directory:
+    "contracts/{*.sol,bridge/{*.sol,interfaces/*.sol,token/*.sol,mock/*.sol,utils/*.sol},interfaces/IWormhole.sol,mock/*.sol,nft/{*.sol,interfaces/*.sol,token/*.sol,mock/*.sol}}",
   networks: {
     development: {
       host: "127.0.0.1",
@@ -140,7 +141,7 @@ module.exports = {
       },
       network_id: 0x4e454153,
       gas: 10000000,
-      from: "0x3bC7f2e458aC4E55F941C458cfD8c6851a591B4F", // public key
+      from: "0x8F26A0025dcCc6Cfc07A7d38756280a10E295ad7", // public key
     },
     fantom: {
       provider: () => {
@@ -186,7 +187,7 @@ module.exports = {
         );
       },
       network_id: 596,
-      gasPrice: "0x2f7e8805de",
+      gasPrice: "0x3006b003ea",
       gasLimit: "0x329b140",
       gas: "0x329b0dc",
     },
@@ -212,9 +213,8 @@ module.exports = {
         );
       },
       network_id: 597,
-      gasPrice: "0x2ed51903ea",
-      gasLimit: "0x6fc3540",
-      gas: "0x329b0dc",
+      gasPrice: "0x33a70303ea", // Query for gas parameters.
+      gas: "0x6fc3540", // This is the value reported as "gasLimit" in the query.
     },
     klaytn: {
       // Note that Klaytn works with version 5.3.14 of truffle, but not some of the newer versions.
@@ -348,6 +348,15 @@ module.exports = {
       },
       network_id: 77,
     },
+    base: {
+      provider: () => {
+        return new HDWalletProvider(
+          process.env.MNEMONIC,
+          "https://developer-access-mainnet.base.org"
+        );
+      },
+      network_id: 8453,
+    },
     base_testnet: {
       provider: () => {
         return new HDWalletProvider(
@@ -356,6 +365,33 @@ module.exports = {
         );
       },
       network_id: 84531,
+    },
+    rootstock: {
+      provider: () => {
+        return new HDWalletProvider(
+          process.env.MNEMONIC,
+          "https://public-node.rsk.co"
+        );
+      },
+      network_id: 30,
+    },
+    rootstock_testnet: {
+      provider: () => {
+        return new HDWalletProvider(
+          process.env.MNEMONIC,
+          "https://public-node.testnet.rsk.co"
+        );
+      },
+      network_id: 31,
+    },
+    sepolia_testnet: {
+      provider: () => {
+        return new HDWalletProvider(
+          process.env.MNEMONIC,
+          "https://rpc.ankr.com/eth_sepolia"
+        );
+      },
+      network_id: "11155111",
     },
   },
 
@@ -367,6 +403,7 @@ module.exports = {
           enabled: true,
           runs: 200,
         },
+        viaIR: false,
       },
     },
   },

@@ -29,8 +29,9 @@ type (
 		aptosAccount string
 		aptosHandle  string
 
-		msgC     chan<- *common.MessagePublication
-		obsvReqC <-chan *gossipv1.ObservationRequest
+		msgC          chan<- *common.MessagePublication
+		obsvReqC      <-chan *gossipv1.ObservationRequest
+		readinessSync readiness.Component
 	}
 )
 
@@ -56,11 +57,12 @@ func NewWatcher(
 	obsvReqC <-chan *gossipv1.ObservationRequest,
 ) *Watcher {
 	return &Watcher{
-		aptosRPC:     aptosRPC,
-		aptosAccount: aptosAccount,
-		aptosHandle:  aptosHandle,
-		msgC:         msgC,
-		obsvReqC:     obsvReqC,
+		aptosRPC:      aptosRPC,
+		aptosAccount:  aptosAccount,
+		aptosHandle:   aptosHandle,
+		msgC:          msgC,
+		obsvReqC:      obsvReqC,
+		readinessSync: common.MustConvertChainIdToReadinessSyncing(vaa.ChainIDAptos),
 	}
 }
 
@@ -70,6 +72,13 @@ func (e *Watcher) Run(ctx context.Context) error {
 	})
 
 	logger := supervisor.Logger(ctx)
+
+	logger.Info("Starting watcher",
+		zap.String("watcher_name", "aptos"),
+		zap.String("aptosRPC", e.aptosRPC),
+		zap.String("aptosAccount", e.aptosAccount),
+		zap.String("aptosHandle", e.aptosHandle),
+	)
 
 	logger.Info("Aptos watcher connecting to RPC node ", zap.String("url", e.aptosRPC))
 
@@ -137,7 +146,7 @@ func (e *Watcher) Run(ctx context.Context) error {
 				if !data.Exists() {
 					break
 				}
-				e.observeData(logger, data, nativeSeq)
+				e.observeData(logger, data, nativeSeq, true)
 			}
 
 		case <-timer.C:
@@ -192,7 +201,7 @@ func (e *Watcher) Run(ctx context.Context) error {
 				if !data.Exists() {
 					continue
 				}
-				e.observeData(logger, data, eventSequence.Uint())
+				e.observeData(logger, data, eventSequence.Uint(), false)
 			}
 
 			health, err := e.retrievePayload(aptosHealth)
@@ -223,7 +232,7 @@ func (e *Watcher) Run(ctx context.Context) error {
 					ContractAddress: e.aptosAccount,
 				})
 
-				readiness.SetReady(common.ReadinessAptosSyncing)
+				readiness.SetReady(e.readinessSync)
 			}
 		}
 	}
@@ -241,7 +250,7 @@ func (e *Watcher) retrievePayload(s string) ([]byte, error) {
 	return body, err
 }
 
-func (e *Watcher) observeData(logger *zap.Logger, data gjson.Result, nativeSeq uint64) {
+func (e *Watcher) observeData(logger *zap.Logger, data gjson.Result, nativeSeq uint64, isReobservation bool) {
 	em := data.Get("sender")
 	if !em.Exists() {
 		logger.Error("sender field missing")
@@ -304,6 +313,7 @@ func (e *Watcher) observeData(logger *zap.Logger, data gjson.Result, nativeSeq u
 		EmitterAddress:   a,
 		Payload:          pl,
 		ConsistencyLevel: uint8(consistencyLevel.Uint()),
+		IsReobservation:  isReobservation,
 	}
 
 	aptosMessagesConfirmed.Inc()

@@ -15,11 +15,18 @@ import (
 
 	"github.com/certusone/wormhole/node/pkg/accountant"
 	"github.com/certusone/wormhole/node/pkg/common"
+	"github.com/certusone/wormhole/node/pkg/gwrelayer"
 	gossipv1 "github.com/certusone/wormhole/node/pkg/proto/gossip/v1"
-	"github.com/certusone/wormhole/node/pkg/reporter"
 	"github.com/certusone/wormhole/node/pkg/supervisor"
 	"github.com/wormhole-foundation/wormhole/sdk/vaa"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	dto "github.com/prometheus/client_model/go"
 )
+
+var GovInterval = time.Minute
+var CleanupInterval = time.Second * 30
 
 type (
 	// Observation defines the interface for any events observed by the guardian.
@@ -33,6 +40,8 @@ type (
 		SigningDigest() ethcommon.Hash
 		// IsReliable returns whether this message is considered reliable meaning it can be reobserved.
 		IsReliable() bool
+		// IsReobservation returns whether this message is the result of a reobservation request.
+		IsReobservation() bool
 		// HandleQuorum finishes processing the observation once a quorum of signatures have
 		// been received for it.
 		HandleQuorum(sigs []*vaa.Signature, hash string, p *Processor)
@@ -42,8 +51,10 @@ type (
 	state struct {
 		// First time this digest was seen (possibly even before we observed it ourselves).
 		firstObserved time.Time
-		// The most recent time that a re-observation request was sent to the guardian network.
-		lastRetry time.Time
+		// A re-observation request shall not be sent before this time.
+		nextRetry time.Time
+		// Number of times we sent a re-observation request
+		retryCtr uint
 		// Copy of our observation.
 		ourObservation Observation
 		// Map of signatures seen by guardian. During guardian set updates, this may contain signatures belonging
@@ -55,8 +66,6 @@ type (
 		settled bool
 		// Human-readable description of the VAA's source, used for metrics.
 		source string
-		// Number of times the cleanup service has attempted to retransmit this VAA.
-		retryCount uint
 		// Copy of the bytes we submitted (ourObservation, but signed and serialized). Used for retransmissions.
 		ourMsg []byte
 		// The hash of the transaction in which the observation was made.  Used for re-observation requests.
@@ -86,7 +95,7 @@ type Processor struct {
 	// gossipSendC is a channel of outbound messages to broadcast on p2p
 	gossipSendC chan<- []byte
 	// obsvC is a channel of inbound decoded observations from p2p
-	obsvC chan *gossipv1.SignedObservation
+	obsvC chan *common.MsgWithTimeStamp[gossipv1.SignedObservation]
 
 	// obsvReqSendC is a send-only channel of outbound re-observation requests to broadcast on p2p
 	obsvReqSendC chan<- *gossipv1.ObservationRequest
@@ -94,13 +103,8 @@ type Processor struct {
 	// signedInC is a channel of inbound signed VAA observations from p2p
 	signedInC <-chan *gossipv1.SignedVAAWithQuorum
 
-	// injectC is a channel of VAAs injected locally.
-	injectC <-chan *vaa.VAA
-
 	// gk is the node's guardian private key
 	gk *ecdsa.PrivateKey
-
-	attestationEvents *reporter.AttestationEventReporter
 
 	logger *zap.Logger
 
@@ -118,14 +122,29 @@ type Processor struct {
 	state *aggregationState
 	// gk pk as eth address
 	ourAddr ethcommon.Address
-	// cleanup triggers periodic state cleanup
-	cleanup *time.Ticker
 
-	governor    *governor.ChainGovernor
-	acct        *accountant.Accountant
-	acctReadC   <-chan *common.MessagePublication
-	pythnetVaas map[string]PythNetVaaEntry
+	governor       *governor.ChainGovernor
+	acct           *accountant.Accountant
+	acctReadC      <-chan *common.MessagePublication
+	pythnetVaas    map[string]PythNetVaaEntry
+	gatewayRelayer *gwrelayer.GatewayRelayer
 }
+
+var (
+	observationChanDelay = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "wormhole_signed_observation_channel_delay_us",
+			Help:    "Latency histogram for delay of signed observations in channel",
+			Buckets: []float64{10.0, 20.0, 50.0, 100.0, 1000.0, 5000.0, 10000.0},
+		})
+
+	observationTotalDelay = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "wormhole_signed_observation_total_delay_us",
+			Help:    "Latency histogram for total time to process signed observations",
+			Buckets: []float64{10.0, 20.0, 50.0, 100.0, 1000.0, 5000.0, 10000.0},
+		})
+)
 
 func NewProcessor(
 	ctx context.Context,
@@ -133,16 +152,15 @@ func NewProcessor(
 	msgC <-chan *common.MessagePublication,
 	setC <-chan *common.GuardianSet,
 	gossipSendC chan<- []byte,
-	obsvC chan *gossipv1.SignedObservation,
+	obsvC chan *common.MsgWithTimeStamp[gossipv1.SignedObservation],
 	obsvReqSendC chan<- *gossipv1.ObservationRequest,
-	injectC <-chan *vaa.VAA,
 	signedInC <-chan *gossipv1.SignedVAAWithQuorum,
 	gk *ecdsa.PrivateKey,
 	gst *common.GuardianSetState,
-	attestationEvents *reporter.AttestationEventReporter,
 	g *governor.ChainGovernor,
 	acct *accountant.Accountant,
 	acctReadC <-chan *common.MessagePublication,
+	gatewayRelayer *gwrelayer.GatewayRelayer,
 ) *Processor {
 
 	return &Processor{
@@ -152,28 +170,26 @@ func NewProcessor(
 		obsvC:        obsvC,
 		obsvReqSendC: obsvReqSendC,
 		signedInC:    signedInC,
-		injectC:      injectC,
 		gk:           gk,
 		gst:          gst,
 		db:           db,
 
-		attestationEvents: attestationEvents,
-
-		logger:      supervisor.Logger(ctx),
-		state:       &aggregationState{observationMap{}},
-		ourAddr:     crypto.PubkeyToAddress(gk.PublicKey),
-		governor:    g,
-		acct:        acct,
-		acctReadC:   acctReadC,
-		pythnetVaas: make(map[string]PythNetVaaEntry),
+		logger:         supervisor.Logger(ctx),
+		state:          &aggregationState{observationMap{}},
+		ourAddr:        crypto.PubkeyToAddress(gk.PublicKey),
+		governor:       g,
+		acct:           acct,
+		acctReadC:      acctReadC,
+		pythnetVaas:    make(map[string]PythNetVaaEntry),
+		gatewayRelayer: gatewayRelayer,
 	}
 }
 
 func (p *Processor) Run(ctx context.Context) error {
-	p.cleanup = time.NewTicker(30 * time.Second)
+	cleanup := time.NewTicker(CleanupInterval)
 
 	// Always initialize the timer so don't have a nil pointer in the case below. It won't get rearmed after that.
-	govTimer := time.NewTimer(time.Minute)
+	govTimer := time.NewTimer(GovInterval)
 
 	for {
 		select {
@@ -181,6 +197,16 @@ func (p *Processor) Run(ctx context.Context) error {
 			if p.acct != nil {
 				p.acct.Close()
 			}
+
+			// Log these as warnings so they show up in the benchmark logs.
+			metric := &dto.Metric{}
+			_ = observationChanDelay.Write(metric)
+			p.logger.Warn("PROCESSOR_METRICS", zap.Any("observationChannelDelay", metric.String()))
+
+			metric = &dto.Metric{}
+			_ = observationTotalDelay.Write(metric)
+			p.logger.Warn("PROCESSOR_METRICS", zap.Any("observationProcessingDelay", metric.String()))
+
 			return ctx.Err()
 		case p.gs = <-p.setC:
 			p.logger.Info("guardian set updated",
@@ -196,30 +222,29 @@ func (p *Processor) Run(ctx context.Context) error {
 			if p.acct != nil {
 				shouldPub, err := p.acct.SubmitObservation(k)
 				if err != nil {
-					return fmt.Errorf("acct: failed to process message `%s`: %w", k.MessageIDString(), err)
+					return fmt.Errorf("failed to process message `%s`: %w", k.MessageIDString(), err)
 				}
 				if !shouldPub {
 					continue
 				}
 			}
-			p.handleMessage(ctx, k)
+			p.handleMessage(k)
 
 		case k := <-p.acctReadC:
 			if p.acct == nil {
-				return fmt.Errorf("acct: received an accountant event when accountant is not configured")
+				return fmt.Errorf("received an accountant event when accountant is not configured")
 			}
 			// SECURITY defense-in-depth: Make sure the accountant did not generate an unexpected message.
 			if !p.acct.IsMessageCoveredByAccountant(k) {
-				return fmt.Errorf("acct: accountant published a message that is not covered by it: `%s`", k.MessageIDString())
+				return fmt.Errorf("accountant published a message that is not covered by it: `%s`", k.MessageIDString())
 			}
-			p.handleMessage(ctx, k)
-		case v := <-p.injectC:
-			p.handleInjection(ctx, v)
+			p.handleMessage(k)
 		case m := <-p.obsvC:
+			observationChanDelay.Observe(float64(time.Since(m.Timestamp).Microseconds()))
 			p.handleObservation(ctx, m)
 		case m := <-p.signedInC:
 			p.handleInboundSignedVAAWithQuorum(ctx, m)
-		case <-p.cleanup.C:
+		case <-cleanup.C:
 			p.handleCleanup(ctx)
 		case <-govTimer.C:
 			if p.governor != nil {
@@ -231,25 +256,25 @@ func (p *Processor) Run(ctx context.Context) error {
 					for _, k := range toBePublished {
 						// SECURITY defense-in-depth: Make sure the governor did not generate an unexpected message.
 						if msgIsGoverned, err := p.governor.IsGovernedMsg(k); err != nil {
-							return fmt.Errorf("cgov: governor failed to determine if message should be governed: `%s`: %w", k.MessageIDString(), err)
+							return fmt.Errorf("governor failed to determine if message should be governed: `%s`: %w", k.MessageIDString(), err)
 						} else if !msgIsGoverned {
-							return fmt.Errorf("cgov: governor published a message that should not be governed: `%s`", k.MessageIDString())
+							return fmt.Errorf("governor published a message that should not be governed: `%s`", k.MessageIDString())
 						}
 						if p.acct != nil {
 							shouldPub, err := p.acct.SubmitObservation(k)
 							if err != nil {
-								return fmt.Errorf("acct: failed to process message released by governor `%s`: %w", k.MessageIDString(), err)
+								return fmt.Errorf("failed to process message released by governor `%s`: %w", k.MessageIDString(), err)
 							}
 							if !shouldPub {
 								continue
 							}
 						}
-						p.handleMessage(ctx, k)
+						p.handleMessage(k)
 					}
 				}
 			}
 			if (p.governor != nil) || (p.acct != nil) {
-				govTimer = time.NewTimer(time.Minute)
+				govTimer.Reset(GovInterval)
 			}
 		}
 	}
@@ -264,26 +289,30 @@ func (p *Processor) storeSignedVAA(v *vaa.VAA) error {
 	return p.db.StoreSignedVAA(v)
 }
 
-func (p *Processor) getSignedVAA(id db.VAAID) (*vaa.VAA, error) {
+// haveSignedVAA returns true if we already have a VAA for the given VAAID
+func (p *Processor) haveSignedVAA(id db.VAAID) bool {
 	if id.EmitterChain == vaa.ChainIDPythNet {
-		key := fmt.Sprintf("%v/%v", id.EmitterAddress, id.Sequence)
-		ret, exists := p.pythnetVaas[key]
-		if exists {
-			return ret.v, nil
+		if p.pythnetVaas == nil {
+			return false
 		}
-
-		return nil, db.ErrVAANotFound
+		key := fmt.Sprintf("%v/%v", id.EmitterAddress, id.Sequence)
+		_, exists := p.pythnetVaas[key]
+		return exists
 	}
 
-	vb, err := p.db.GetSignedVAABytes(id)
+	if p.db == nil {
+		return false
+	}
+
+	ok, err := p.db.HasVAA(id)
+
 	if err != nil {
-		return nil, err
+		p.logger.Error("failed to look up VAA in database",
+			zap.String("vaaID", string(id.Bytes())),
+			zap.Error(err),
+		)
+		return false
 	}
 
-	vaa, err := vaa.Unmarshal(vb)
-	if err != nil {
-		panic("failed to unmarshal VAA from db")
-	}
-
-	return vaa, err
+	return ok
 }

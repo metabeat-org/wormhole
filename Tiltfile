@@ -15,6 +15,16 @@ def set_replicas_in_statefulset(config_yaml, statefulset_name,  num_replicas):
             obj["spec"]["replicas"] = num_replicas
     return config_yaml
 
+# set the env value of all containers in all jobs
+def set_env_in_jobs(config_yaml, name, value):
+    for obj in config_yaml:
+        if obj["kind"] == "Job":
+            for container in obj["spec"]["template"]["spec"]["containers"]:
+                if not "env" in container:
+                    container["env"] = []
+                container["env"].append({"name": name, "value": value})
+    return config_yaml
+
 allow_k8s_contexts("ci")
 
 # Disable telemetry by default
@@ -35,14 +45,13 @@ config.define_string("num", False, "Number of guardian nodes to run")
 #
 config.define_string("namespace", False, "Kubernetes namespace to use")
 
-# These arguments will enable writing Guardian events to a cloud BigTable instance.
-# Writing to a cloud BigTable is optional. These arguments are not required to run the devnet.
-config.define_string("gcpProject", False, "GCP project ID for BigTable persistence")
-config.define_string("bigTableKeyPath", False, "Path to BigTable json key file")
-
 # When running Tilt on a server, this can be used to set the public hostname Tilt runs on
 # for service links in the UI to work.
 config.define_string("webHost", False, "Public hostname for port forwards")
+
+# When running Tilt on a server, this can be used to set the public hostname Tilt runs on
+# for service links in the UI to work.
+config.define_string("guardiand_loglevel", False, "Log level for guardiand (debug, info, warn, error, dpanic, panic, fatal)")
 
 # Components
 config.define_bool("near", False, "Enable Near component")
@@ -55,38 +64,46 @@ config.define_bool("solana", False, "Enable Solana component")
 config.define_bool("pythnet", False, "Enable PythNet component")
 config.define_bool("terra_classic", False, "Enable Terra Classic component")
 config.define_bool("terra2", False, "Enable Terra 2 component")
-config.define_bool("spy_relayer", False, "Enable spy relayer")
 config.define_bool("ci_tests", False, "Enable tests runner component")
 config.define_bool("guardiand_debug", False, "Enable dlv endpoint for guardiand")
 config.define_bool("node_metrics", False, "Enable Prometheus & Grafana for Guardian metrics")
 config.define_bool("guardiand_governor", False, "Enable chain governor in guardiand")
 config.define_bool("wormchain", False, "Enable a wormchain node")
 config.define_bool("ibc_relayer", False, "Enable IBC relayer between cosmos chains")
+config.define_bool("redis", False, "Enable a redis instance")
+config.define_bool("generic_relayer", False, "Enable the generic relayer off-chain component")
+config.define_bool("query_server", False, "Enable cross-chain query server")
 
 cfg = config.parse()
 num_guardians = int(cfg.get("num", "1"))
 namespace = cfg.get("namespace", "wormhole")
-gcpProject = cfg.get("gcpProject", "")
-bigTableKeyPath = cfg.get("bigTableKeyPath", "")
 webHost = cfg.get("webHost", "localhost")
 ci = cfg.get("ci", False)
 algorand = cfg.get("algorand", ci)
 near = cfg.get("near", ci)
 aptos = cfg.get("aptos", ci)
-sui = cfg.get("sui", False)
+sui = cfg.get("sui", ci)
 evm2 = cfg.get("evm2", ci)
 solana = cfg.get("solana", ci)
 pythnet = cfg.get("pythnet", False)
 terra_classic = cfg.get("terra_classic", ci)
 terra2 = cfg.get("terra2", ci)
 wormchain = cfg.get("wormchain", ci)
-spy_relayer = cfg.get("spy_relayer", ci)
 ci_tests = cfg.get("ci_tests", ci)
 guardiand_debug = cfg.get("guardiand_debug", False)
 node_metrics = cfg.get("node_metrics", False)
 guardiand_governor = cfg.get("guardiand_governor", False)
-ibc_relayer = cfg.get("ibc_relayer", False)
+ibc_relayer = cfg.get("ibc_relayer", ci)
 btc = cfg.get("btc", False)
+redis = cfg.get('redis', ci)
+generic_relayer = cfg.get("generic_relayer", ci)
+query_server = cfg.get("query_server", ci)
+
+if ci:
+    guardiand_loglevel = cfg.get("guardiand_loglevel", "warn")
+else:
+    guardiand_loglevel = cfg.get("guardiand_loglevel", "info")
+
 
 if cfg.get("manual", False):
     trigger_mode = TRIGGER_MODE_MANUAL
@@ -101,31 +118,27 @@ if not ci:
 def k8s_yaml_with_ns(objects):
     return k8s_yaml(namespace_inject(objects, namespace))
 
-local_resource(
-    name = "const-gen",
-    deps = ["scripts", "clients", "ethereum/.env.test"],
-    cmd = 'tilt docker build -- --target const-export -f Dockerfile.const -o type=local,dest=. --build-arg num_guardians=%s .' % (num_guardians),
-    env = {"DOCKER_BUILDKIT": "1"},
-    allow_parallel = True,
-    trigger_mode = trigger_mode,
+docker_build(
+    ref = "cli-gen",
+    context = ".",
+    dockerfile = "Dockerfile.cli",
+)
+
+docker_build(
+    ref = "const-gen",
+    context = ".",
+    dockerfile = "Dockerfile.const",
+    build_args={"num_guardians": '%s' % (num_guardians)},
 )
 
 # node
-
-if bigTableKeyPath != "":
-    k8s_yaml_with_ns(
-        secret_yaml_generic(
-            "node-bigtable-key",
-            from_file = "bigtable-key.json=" + bigTableKeyPath,
-        ),
-    )
 
 docker_build(
     ref = "guardiand-image",
     context = ".",
     dockerfile = "node/Dockerfile",
     target = "build",
-    ignore=["./sdk/js"]
+    ignore=["./sdk/js", "./relayer"]
 )
 
 def command_with_dlv(argv):
@@ -152,27 +165,11 @@ def build_node_yaml():
             if container["name"] != "guardiand":
                 fail("container 0 is not guardiand")
 
+            container["command"] += ["--logLevel="+guardiand_loglevel]
+
             if guardiand_debug:
                 container["command"] = command_with_dlv(container["command"])
-                container["command"] += ["--logLevel=debug"]
                 print(container["command"])
-            elif ci:
-                container["command"] += ["--logLevel=warn"]
-
-            if gcpProject != "":
-                container["command"] += [
-                    "--bigTablePersistenceEnabled",
-                    "--bigTableInstanceName",
-                    "wormhole",
-                    "--bigTableTableName",
-                    "v2Events",
-                    "--bigTableTopicName",
-                    "new-vaa-devnet",
-                    "--bigTableKeyPath",
-                    "/tmp/mounted-keys/bigtable-key.json",
-                    "--bigTableGCPProject",
-                    gcpProject,
-                ]
 
             if aptos:
                 container["command"] += [
@@ -187,15 +184,11 @@ def build_node_yaml():
             if sui:
                 container["command"] += [
                     "--suiRPC",
-                    "http://sui:9002",
-# In testnet and mainnet, you will need to also specify the suiPackage argument.  In Devnet, we subscribe to
-# event traffic purely based on the account since that is the only thing that is deterministic.
-#                    "--suiPackage",
-#                    "0x.....",
-                    "--suiAccount",
-                    "0x2acab6bb0e4722e528291bc6ca4f097e18ce9331",
+                    "http://sui:9000",
+                    "--suiMoveEventType",
+                    "0x7f6cebb8a489654d7a759483bd653c4be3e5ccfef17a8b5fd3ba98bd072fabc3::publish_message::WormholeMessage",
                     "--suiWS",
-                    "sui:9001",
+                    "sui:9000",
                 ]
 
             if evm2:
@@ -250,7 +243,7 @@ def build_node_yaml():
             if algorand:
                 container["command"] += [
                     "--algorandAppID",
-                    "4",
+                    "1004",
                     "--algorandIndexerRPC",
                     "http://algorand:8980",
                     "--algorandIndexerToken",
@@ -276,22 +269,40 @@ def build_node_yaml():
 
             if wormchain:
                 container["command"] += [
-                    "--wormchainWS",
-                    "ws://wormchain:26657/websocket",
-                    "--wormchainLCD",
-                    "http://wormchain:1317",
                     "--wormchainURL",
                     "wormchain:9090",
-                    "--wormchainKeyPath",
-                    "/tmp/mounted-keys/wormchain/wormchainKey",
-                    "--wormchainKeyPassPhrase",
+
+                    "--accountantContract",
+                    "wormhole14hj2tavq8fpesdwxxcu44rty3hh90vhujrvcmstl4zr3txmfvw9srrg465",
+                    "--accountantKeyPath",
+                    "/tmp/mounted-keys/wormchain/accountantKey",
+                    "--accountantKeyPassPhrase",
                     "test0000",
                     "--accountantWS",
                     "http://wormchain:26657",
-                    "--accountantContract",
-                    "wormhole14hj2tavq8fpesdwxxcu44rty3hh90vhujrvcmstl4zr3txmfvw9srrg465",
                     "--accountantCheckEnabled",
-                    "true"
+                    "true",
+
+                    "--ibcContract",
+                    "wormhole1nc5tatafv6eyq7llkr2gv50ff9e22mnf70qgjlv737ktmt4eswrq0kdhcj",
+                    "--ibcWS",
+                    "ws://wormchain:26657/websocket",
+                    "--ibcLCD",
+                    "http://wormchain:1317",
+
+                    "--gatewayRelayerContract",
+                    "wormhole17p9rzwnnfxcjp32un9ug7yhhzgtkhvl9jfksztgw5uh69wac2pgshdnj3k",
+                    "--gatewayRelayerKeyPath",
+                    "/tmp/mounted-keys/wormchain/gwrelayerKey",
+                    "--gatewayRelayerKeyPassPhrase",
+                    "test0000",
+
+                    "--gatewayContract",
+                    "wormhole17p9rzwnnfxcjp32un9ug7yhhzgtkhvl9jfksztgw5uh69wac2pgshdnj3k",
+                    "--gatewayWS",
+                    "ws://wormchain:26657/websocket",
+                    "--gatewayLCD",
+                    "http://wormchain:1317"
                 ]
 
     return encode_yaml_stream(node_yaml_with_replicas)
@@ -428,9 +439,7 @@ if solana or pythnet:
         port_forwards = [
             port_forward(8899, name = "Solana RPC [:8899]", host = webHost),
             port_forward(8900, name = "Solana WS [:8900]", host = webHost),
-            port_forward(9000, name = "Solana PubSub [:9000]", host = webHost),
         ],
-        resource_deps = ["const-gen"],
         labels = ["solana"],
         trigger_mode = trigger_mode,
     )
@@ -443,8 +452,9 @@ docker_build(
     dockerfile = "./ethereum/Dockerfile",
 
     # ignore local node_modules (in case they're present)
-    ignore = ["./ethereum/node_modules"],
-
+    ignore = ["./node_modules"],
+    build_args = {"num_guardians": str(num_guardians), "dev": str(not ci)},
+  
     # sync external scripts for incremental development
     # (everything else needs to be restarted from scratch for determinism)
     #
@@ -455,7 +465,7 @@ docker_build(
     ],
 )
 
-if spy_relayer:
+if redis or generic_relayer:
     docker_build(
         ref = "redis",
         context = ".",
@@ -463,61 +473,50 @@ if spy_relayer:
         dockerfile = "third_party/redis/Dockerfile",
     )
 
-    k8s_yaml_with_ns("devnet/redis.yaml")
-
+if redis:
     k8s_resource(
         "redis",
         port_forwards = [
             port_forward(6379, name = "Redis Default [:6379]", host = webHost),
         ],
-        labels = ["spy-relayer"],
+        labels = ["redis"],
         trigger_mode = trigger_mode,
     )
 
+    k8s_yaml_with_ns("devnet/redis.yaml")
+
+if generic_relayer:
+    k8s_resource(
+        "redis-relayer",
+        port_forwards = [
+            port_forward(6378, name = "Generic Relayer Redis [:6378]", host = webHost),
+        ],
+        labels = ["redis-relayer"],
+        trigger_mode = trigger_mode,
+    )
+
+    k8s_yaml_with_ns("devnet/redis-relayer.yaml")
+
+
+
+if generic_relayer:
+    k8s_resource(
+        "relayer-engine",
+        resource_deps = ["guardian", "redis-relayer", "spy"],
+        port_forwards = [
+            port_forward(3003, container_port=3000, name = "Bullmq UI [:3003]", host = webHost),
+        ],
+        labels = ["relayer-engine"],
+        trigger_mode = trigger_mode,
+    )
     docker_build(
-        ref = "spy-relay-image",
-        context = "relayer/spy_relayer",
-        dockerfile = "relayer/spy_relayer/Dockerfile",
-        live_update = []
+        ref = "relayer-engine",
+        context = ".",
+        only = ["./relayer/generic_relayer", "./ethereum/ts-scripts/relayer/config"],
+        dockerfile = "relayer/generic_relayer/relayer-engine-v2/Dockerfile",
+        build_args = {"dev": str(not ci)}
     )
-
-    k8s_yaml_with_ns("devnet/spy-listener.yaml")
-
-    k8s_resource(
-        "spy-listener",
-        resource_deps = ["guardian", "redis", "spy"],
-        port_forwards = [
-            port_forward(6062, container_port = 6060, name = "Debug/Status Server [:6062]", host = webHost),
-            port_forward(4201, name = "REST [:4201]", host = webHost),
-            port_forward(8082, name = "Prometheus [:8082]", host = webHost),
-        ],
-        labels = ["spy-relayer"],
-        trigger_mode = trigger_mode,
-    )
-
-    k8s_yaml_with_ns("devnet/spy-relayer.yaml")
-
-    k8s_resource(
-        "spy-relayer",
-        resource_deps = ["guardian", "redis"],
-        port_forwards = [
-            port_forward(8083, name = "Prometheus [:8083]", host = webHost),
-        ],
-        labels = ["spy-relayer"],
-        trigger_mode = trigger_mode,
-    )
-
-    k8s_yaml_with_ns("devnet/spy-wallet-monitor.yaml")
-
-    k8s_resource(
-        "spy-wallet-monitor",
-        resource_deps = ["guardian", "redis"],
-        port_forwards = [
-            port_forward(8084, name = "Prometheus [:8084]", host = webHost),
-        ],
-        labels = ["spy-relayer"],
-        trigger_mode = trigger_mode,
-    )
+    k8s_yaml_with_ns("devnet/relayer-engine.yaml")
 
 k8s_yaml_with_ns("devnet/eth-devnet.yaml")
 
@@ -526,7 +525,6 @@ k8s_resource(
     port_forwards = [
         port_forward(8545, name = "Ganache RPC [:8545]", host = webHost),
     ],
-    resource_deps = ["const-gen"],
     labels = ["evm"],
     trigger_mode = trigger_mode,
 )
@@ -539,7 +537,6 @@ if evm2:
         port_forwards = [
             port_forward(8546, name = "Ganache RPC [:8546]", host = webHost),
         ],
-        resource_deps = ["const-gen"],
         labels = ["evm"],
         trigger_mode = trigger_mode,
     )
@@ -566,8 +563,18 @@ if ci_tests:
             sync("./testing", "/app/testing"),
         ],
     )
+    docker_build(
+        ref = "query-sdk-test-image",
+        context = ".",
+        dockerfile = "testing/Dockerfile.querysdk.test",
+        only = [],
+        live_update = [
+            sync("./sdk/js/src", "/app/sdk/js-query/src"),
+            sync("./testing", "/app/testing"),
+        ],
+    )
 
-    k8s_yaml_with_ns("devnet/tests.yaml")
+    k8s_yaml_with_ns(encode_yaml_stream(set_env_in_jobs(read_yaml_stream("devnet/tests.yaml"), "NUM_GUARDIANS", str(num_guardians))))
 
     # separate resources to parallelize docker builds
     k8s_resource(
@@ -586,7 +593,19 @@ if ci_tests:
         "accountant-ci-tests",
         labels = ["ci"],
         trigger_mode = trigger_mode,
-        resource_deps = ["const-gen"], # uses devnet-consts.json, but wormchain/contracts/tools/test_accountant.sh handles waiting for guardian, not having deps gets the build earlier
+        resource_deps = [], # uses devnet-consts.json, but wormchain/contracts/tools/test_accountant.sh handles waiting for guardian, not having deps gets the build earlier
+    )
+    k8s_resource(
+        "query-ci-tests",
+        labels = ["ci"],
+        trigger_mode = trigger_mode,
+        resource_deps = [], # node/hack/query/test/test_query.sh handles waiting for guardian, not having deps gets the build earlier
+    )
+    k8s_resource(
+        "query-sdk-ci-tests",
+        labels = ["ci"],
+        trigger_mode = trigger_mode,
+        resource_deps = [], # testing/querysdk.sh handles waiting for query-server, not having deps gets the build earlier
     )
 
 if terra_classic:
@@ -610,7 +629,6 @@ if terra_classic:
             port_forward(26657, name = "Terra RPC [:26657]", host = webHost),
             port_forward(1317, name = "Terra LCD [:1317]", host = webHost),
         ],
-        resource_deps = ["const-gen"],
         labels = ["terra"],
         trigger_mode = trigger_mode,
     )
@@ -658,7 +676,6 @@ if terra2:
             port_forward(26658, container_port = 26657, name = "Terra 2 RPC [:26658]", host = webHost),
             port_forward(1318, container_port = 1317, name = "Terra 2 LCD [:1318]", host = webHost),
         ],
-        resource_deps = ["const-gen"],
         labels = ["terra2"],
         trigger_mode = trigger_mode,
     )
@@ -706,7 +723,6 @@ if algorand:
             port_forward(4002, name = "KMD [:4002]", host = webHost),
             port_forward(8980, name = "Indexer [:8980]", host = webHost),
         ],
-        resource_deps = ["const-gen"],
         labels = ["algorand"],
         trigger_mode = trigger_mode,
     )
@@ -716,21 +732,20 @@ if sui:
 
     docker_build(
         ref = "sui-node",
-        context = "sui",
+        target = "sui",
+        context = ".",
         dockerfile = "sui/Dockerfile",
         ignore = ["./sui/sui.log*", "sui/sui.log*", "sui.log.*"],
-        only = ["Dockerfile", "scripts"],
+        only = ["./sui"],
     )
 
     k8s_resource(
         "sui",
         port_forwards = [
-            port_forward(9001, name = "WS [:9001]", host = webHost),
-            port_forward(9002, name = "RPC [:9002]", host = webHost),
+            port_forward(9000, 9000, name = "RPC [:9000]", host = webHost),
             port_forward(5003, name = "Faucet [:5003]", host = webHost),
             port_forward(9184, name = "Prometheus [:9184]", host = webHost),
         ],
-#        resource_deps = ["const-gen"],
         labels = ["sui"],
         trigger_mode = trigger_mode,
     )
@@ -758,7 +773,6 @@ if near:
             port_forward(3030, name = "Node [:3030]", host = webHost),
             port_forward(3031, name = "webserver [:3031]", host = webHost),
         ],
-        resource_deps = ["const-gen"],
         labels = ["near"],
         trigger_mode = trigger_mode,
     )
@@ -832,14 +846,13 @@ if wormchain:
             port_forward(9090, container_port = 9090, name = "GRPC", host = webHost),
             port_forward(26659, container_port = 26657, name = "TENDERMINT [:26659]", host = webHost)
         ],
-        resource_deps = ["const-gen"],
         labels = ["wormchain"],
         trigger_mode = trigger_mode,
     )
 
     k8s_resource(
         "wormchain-deploy",
-        resource_deps = ["const-gen", "wormchain"],
+        resource_deps = ["wormchain"],
         labels = ["wormchain"],
         trigger_mode = trigger_mode,
     )
@@ -859,7 +872,7 @@ if ibc_relayer:
         port_forwards = [
             port_forward(7597, name = "HTTPDEBUG [:7597]", host = webHost),
         ],
-        resource_deps = ["wormchain", "terra2-terrad"],
+        resource_deps = ["wormchain-deploy", "terra2-terrad"],
         labels = ["ibc-relayer"],
         trigger_mode = trigger_mode,
     )
@@ -900,7 +913,19 @@ if aptos:
             port_forward(6181, name = "FullNode [:6181]", host = webHost),
             port_forward(8081, name = "Faucet [:8081]", host = webHost),
         ],
-        resource_deps = ["const-gen"],
         labels = ["aptos"],
         trigger_mode = trigger_mode,
+    )
+
+if query_server:
+    k8s_yaml_with_ns("devnet/query-server.yaml")
+
+    k8s_resource(
+        "query-server",
+        resource_deps = ["guardian"],
+        port_forwards = [
+            port_forward(6069, name = "REST [:6069]", host = webHost)
+        ],
+        labels = ["query-server"],
+        trigger_mode = trigger_mode
     )

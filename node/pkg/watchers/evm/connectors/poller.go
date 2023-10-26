@@ -11,7 +11,6 @@ import (
 	ethEvent "github.com/ethereum/go-ethereum/event"
 
 	ethereum "github.com/ethereum/go-ethereum"
-	ethCommon "github.com/ethereum/go-ethereum/common"
 	ethHexUtils "github.com/ethereum/go-ethereum/common/hexutil"
 
 	"go.uber.org/zap"
@@ -36,6 +35,9 @@ type BlockPollConnector struct {
 func NewBlockPollConnector(ctx context.Context, baseConnector Connector, finalizer PollFinalizer, delay time.Duration, useFinalized bool, publishSafeBlocks bool) (*BlockPollConnector, error) {
 	if publishSafeBlocks && !useFinalized {
 		return nil, fmt.Errorf("publishSafeBlocks may only be enabled if useFinalized is enabled")
+	}
+	if finalizer == nil {
+		return nil, fmt.Errorf("finalizer must not be nil; Use finalizers.NewDefaultFinalizer() if you want to have no finalizer.")
 	}
 	connector := &BlockPollConnector{
 		Connector:         baseConnector,
@@ -143,17 +145,15 @@ func (b *BlockPollConnector) pollBlocks(ctx context.Context, logger *zap.Logger,
 			return lastPublishedBlock, fmt.Errorf("failed to fetch next block (%d): %w", nextBlockNumber.Uint64(), err)
 		}
 
-		if b.finalizer != nil {
-			finalized, err := b.isBlockFinalizedWithTimeout(ctx, block)
-			if err != nil {
-				logger.Error("failed to check block finalization",
-					zap.Uint64("block", block.Number.Uint64()), zap.Error(err))
-				return lastPublishedBlock, fmt.Errorf("failed to check block finalization (%d): %w", block.Number.Uint64(), err)
-			}
+		finalized, err := b.isBlockFinalizedWithTimeout(ctx, block)
+		if err != nil {
+			logger.Error("failed to check block finalization",
+				zap.Uint64("block", block.Number.Uint64()), zap.Error(err))
+			return lastPublishedBlock, fmt.Errorf("failed to check block finalization (%d): %w", block.Number.Uint64(), err)
+		}
 
-			if !finalized {
-				break
-			}
+		if !finalized {
+			break
 		}
 
 		b.blockFeed.Send(block)
@@ -223,16 +223,7 @@ func getBlock(ctx context.Context, logger *zap.Logger, conn Connector, number *b
 		numStr = "latest"
 	}
 
-	type Marshaller struct {
-		Number *ethHexUtils.Big
-		Hash   ethCommon.Hash `json:"hash"`
-
-		// L1BlockNumber is the L1 block number in which an Arbitrum batch containing this block was submitted.
-		// This field is only populated when connecting to Arbitrum.
-		L1BlockNumber *ethHexUtils.Big
-	}
-
-	var m Marshaller
+	var m BlockMarshaller
 	err := conn.RawCallContext(ctx, &m, "eth_getBlockByNumber", numStr, false)
 	if err != nil {
 		logger.Error("failed to get block",

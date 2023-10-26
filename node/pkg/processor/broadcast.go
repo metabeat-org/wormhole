@@ -11,6 +11,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"google.golang.org/protobuf/proto"
 
+	node_common "github.com/certusone/wormhole/node/pkg/common"
 	gossipv1 "github.com/certusone/wormhole/node/pkg/proto/gossip/v1"
 	"github.com/wormhole-foundation/wormhole/sdk/vaa"
 )
@@ -52,6 +53,7 @@ func (p *Processor) broadcastSignature(
 	if p.state.signatures[hash] == nil {
 		p.state.signatures[hash] = &state{
 			firstObserved: time.Now(),
+			nextRetry:     time.Now().Add(nextRetryDuration(0)),
 			signatures:    map[ethcommon.Address][]byte{},
 			source:        "loopback",
 		}
@@ -64,7 +66,14 @@ func (p *Processor) broadcastSignature(
 	p.state.signatures[hash].gs = p.gs // guaranteed to match ourObservation - there's no concurrent access to p.gs
 
 	// Fast path for our own signature
-	go func() { p.obsvC <- &obsv }()
+	// send to obsvC directly if there is capacity, otherwise do it in a go routine.
+	// We can't block here because the same process would be responsible for reading from obsvC.
+	om := node_common.CreateMsgWithTimestamp[gossipv1.SignedObservation](&obsv)
+	select {
+	case p.obsvC <- om:
+	default:
+		go func() { p.obsvC <- om }()
+	}
 
 	observationsBroadcastTotal.Inc()
 }
@@ -85,4 +94,8 @@ func (p *Processor) broadcastSignedVAA(v *vaa.VAA) {
 	}
 
 	p.gossipSendC <- msg
+
+	if p.gatewayRelayer != nil {
+		p.gatewayRelayer.SubmitVAA(v)
+	}
 }

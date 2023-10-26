@@ -86,12 +86,12 @@ func (e *EthereumConnector) TransactionReceipt(ctx context.Context, txHash ethCo
 }
 
 func (e *EthereumConnector) TimeOfBlockByHash(ctx context.Context, hash ethCommon.Hash) (uint64, error) {
-	block, err := e.client.BlockByHash(ctx, hash)
+	block, err := e.client.HeaderByHash(ctx, hash)
 	if err != nil {
 		return 0, err
 	}
 
-	return block.Time(), err
+	return block.Time, err
 }
 
 func (e *EthereumConnector) ParseLogMessagePublished(log ethTypes.Log) (*ethAbi.AbiLogMessagePublished, error) {
@@ -133,7 +133,10 @@ func (e *EthereumConnector) SubscribeForBlocks(ctx context.Context, errC chan er
 
 func (e *EthereumConnector) RawCallContext(ctx context.Context, result interface{}, method string, args ...interface{}) error {
 	return e.rawClient.CallContext(ctx, result, method, args...)
+}
 
+func (e *EthereumConnector) RawBatchCallContext(ctx context.Context, b []ethRpc.BatchElem) error {
+	return e.rawClient.BatchCallContext(ctx, b)
 }
 
 func (e *EthereumConnector) Client() *ethClient.Client {

@@ -17,7 +17,8 @@ import (
 	"github.com/certusone/wormhole/node/pkg/db"
 	gossipv1 "github.com/certusone/wormhole/node/pkg/proto/gossip/v1"
 	"github.com/certusone/wormhole/node/pkg/supervisor"
-	"github.com/certusone/wormhole/node/pkg/wormconn"
+	sdktypes "github.com/cosmos/cosmos-sdk/types"
+	sdktx "github.com/cosmos/cosmos-sdk/types/tx"
 	"github.com/wormhole-foundation/wormhole/sdk"
 	"github.com/wormhole-foundation/wormhole/sdk/vaa"
 
@@ -27,14 +28,19 @@ import (
 	"go.uber.org/zap"
 )
 
-const (
-	MainNetMode = 1
-	TestNetMode = 2
-	DevNetMode  = 3
-	GoTestMode  = 4
-)
+// MsgChannelCapacity specifies the capacity of the message channel used to publish messages released from the accountant.
+// This channel should not back up, but if it does, the accountant will start dropping messages, which would require reobservations.
+const MsgChannelCapacity = 5 * batchSize
 
 type (
+	AccountantWormchainConn interface {
+		Close()
+		SenderAddress() string
+		SubmitQuery(ctx context.Context, contractAddress string, query []byte) ([]byte, error)
+		SignAndBroadcastTx(ctx context.Context, msg sdktypes.Msg) (*sdktx.BroadcastTxResponse, error)
+		BroadcastTxResponseToString(txResp *sdktx.BroadcastTxResponse) string
+	}
+
 	// tokenBridgeKey is the key to the map of token bridges being monitored
 	tokenBridgeKey struct {
 		emitterChainId vaa.ChainID
@@ -74,7 +80,7 @@ type Accountant struct {
 	obsvReqWriteC        chan<- *gossipv1.ObservationRequest
 	contract             string
 	wsUrl                string
-	wormchainConn        *wormconn.ClientConn
+	wormchainConn        AccountantWormchainConn
 	enforceFlag          bool
 	gk                   *ecdsa.PrivateKey
 	gst                  *common.GuardianSetState
@@ -84,7 +90,7 @@ type Accountant struct {
 	pendingTransfersLock sync.Mutex
 	pendingTransfers     map[string]*pendingEntry // Key is the message ID (emitterChain/emitterAddr/seqNo)
 	subChan              chan *common.MessagePublication
-	env                  int
+	env                  common.Environment
 }
 
 // On startup, there can be a large number of re-submission requests.
@@ -98,16 +104,16 @@ func NewAccountant(
 	obsvReqWriteC chan<- *gossipv1.ObservationRequest,
 	contract string, // the address of the smart contract on wormchain
 	wsUrl string, // the URL of the wormchain websocket interface
-	wormchainConn *wormconn.ClientConn, // used for communicating with the smart contract
+	wormchainConn AccountantWormchainConn, // used for communicating with the smart contract
 	enforceFlag bool, // whether or not accountant should be enforced
 	gk *ecdsa.PrivateKey, // the guardian key used for signing observation requests
 	gst *common.GuardianSetState, // used to get the current guardian set index when sending observation requests
 	msgChan chan<- *common.MessagePublication, // the channel where transfers received by the accountant runnable should be published
-	env int, // Controls the set of token bridges to be monitored
+	env common.Environment, // Controls the set of token bridges to be monitored
 ) *Accountant {
 	return &Accountant{
 		ctx:              ctx,
-		logger:           logger,
+		logger:           logger.With(zap.String("component", "gacct")),
 		db:               db,
 		obsvReqWriteC:    obsvReqWriteC,
 		contract:         contract,
@@ -127,14 +133,14 @@ func NewAccountant(
 
 // Run initializes the accountant and starts the watcher runnable.
 func (acct *Accountant) Start(ctx context.Context) error {
-	acct.logger.Debug("acct: entering Start", zap.Bool("enforceFlag", acct.enforceFlag))
+	acct.logger.Debug("entering Start", zap.Bool("enforceFlag", acct.enforceFlag))
 	acct.pendingTransfersLock.Lock()
 	defer acct.pendingTransfersLock.Unlock()
 
 	emitterMap := sdk.KnownTokenbridgeEmitters
-	if acct.env == TestNetMode {
+	if acct.env == common.TestNet {
 		emitterMap = sdk.KnownTestnetTokenbridgeEmitters
-	} else if acct.env == DevNetMode || acct.env == GoTestMode {
+	} else if acct.env == common.UnsafeDevNet || acct.env == common.GoTest || acct.env == common.AccountantMock {
 		emitterMap = sdk.KnownDevnetTokenbridgeEmitters
 	}
 
@@ -153,7 +159,7 @@ func (acct *Accountant) Start(ctx context.Context) error {
 
 		tbe := &tokenBridgeEntry{}
 		acct.tokenBridges[tbk] = tbe
-		acct.logger.Info("acct: will monitor token bridge:", zap.Stringer("emitterChainId", tbk.emitterChainId), zap.Stringer("emitterAddr", tbk.emitterAddr))
+		acct.logger.Info("will monitor token bridge:", zap.Stringer("emitterChainId", tbk.emitterChainId), zap.Stringer("emitterAddr", tbk.emitterAddr))
 	}
 
 	// Load any existing pending transfers from the db.
@@ -162,7 +168,12 @@ func (acct *Accountant) Start(ctx context.Context) error {
 	}
 
 	// Start the watcher to listen to transfer events from the smart contract.
-	if acct.env != GoTestMode {
+	if acct.env == common.AccountantMock {
+		// We're not in a runnable context, so we can't use supervisor.
+		go func() {
+			_ = acct.worker(ctx)
+		}()
+	} else if acct.env != common.GoTest {
 		if err := supervisor.Run(ctx, "acctworker", common.WrapWithScissors(acct.worker, "acctworker")); err != nil {
 			return fmt.Errorf("failed to start submit observation worker: %w", err)
 		}
@@ -201,7 +212,7 @@ func (acct *Accountant) IsMessageCoveredByAccountant(msg *common.MessagePublicat
 	tbk := tokenBridgeKey{emitterChainId: msg.EmitterChain, emitterAddr: msg.EmitterAddress}
 	if _, exists := acct.tokenBridges[tbk]; !exists {
 		if msg.EmitterChain != vaa.ChainIDPythNet {
-			acct.logger.Debug("acct: ignoring vaa because it is not a token bridge", zap.String("msgID", msgId))
+			acct.logger.Debug("ignoring vaa because it is not a token bridge", zap.String("msgID", msgId))
 		}
 
 		return false
@@ -209,7 +220,7 @@ func (acct *Accountant) IsMessageCoveredByAccountant(msg *common.MessagePublicat
 
 	// We only care about transfers.
 	if !vaa.IsTransfer(msg.Payload) {
-		acct.logger.Info("acct: ignoring vaa because it is not a transfer", zap.String("msgID", msgId))
+		acct.logger.Info("ignoring vaa because it is not a transfer", zap.String("msgID", msgId))
 		return false
 	}
 
@@ -221,7 +232,7 @@ func (acct *Accountant) IsMessageCoveredByAccountant(msg *common.MessagePublicat
 // false if not (because it has been submitted to accountant).
 func (acct *Accountant) SubmitObservation(msg *common.MessagePublication) (bool, error) {
 	msgId := msg.MessageIDString()
-	acct.logger.Debug("acct: in SubmitObservation", zap.String("msgID", msgId))
+	acct.logger.Debug("in SubmitObservation", zap.String("msgID", msgId))
 
 	if !acct.IsMessageCoveredByAccountant(msg) {
 		return true, nil
@@ -236,27 +247,28 @@ func (acct *Accountant) SubmitObservation(msg *common.MessagePublication) (bool,
 	if oldEntry, exists := acct.pendingTransfers[msgId]; exists {
 		if oldEntry.digest != digest {
 			digestMismatches.Inc()
-			acct.logger.Error("acct: digest in pending transfer has changed, dropping it",
+			acct.logger.Error("digest in pending transfer has changed, dropping it",
 				zap.String("msgID", msgId),
 				zap.String("oldDigest", oldEntry.digest),
 				zap.String("newDigest", digest),
+				zap.Bool("enforcing", acct.enforceFlag),
 			)
 		} else {
-			acct.logger.Info("acct: blocking transfer because it is already outstanding", zap.String("msgID", msgId))
+			acct.logger.Info("blocking transfer because it is already outstanding", zap.String("msgID", msgId), zap.Bool("enforcing", acct.enforceFlag))
 		}
-		return false, nil
+		return !acct.enforceFlag, nil
 	}
 
 	// Add it to the pending map and the database.
 	pe := &pendingEntry{msg: msg, msgId: msgId, digest: digest}
 	if err := acct.addPendingTransferAlreadyLocked(pe); err != nil {
-		acct.logger.Error("acct: failed to persist pending transfer, blocking publishing", zap.String("msgID", msgId), zap.Error(err))
+		acct.logger.Error("failed to persist pending transfer, blocking publishing", zap.String("msgID", msgId), zap.Error(err))
 		return false, err
 	}
 
 	// This transaction may take a while. Pass it off to the worker so we don't block the processor.
-	if acct.env != GoTestMode {
-		acct.logger.Info("acct: submitting transfer to accountant for approval", zap.String("msgID", msgId), zap.Bool("canPublish", !acct.enforceFlag))
+	if acct.env != common.GoTest {
+		acct.logger.Info("submitting transfer to accountant for approval", zap.String("msgID", msgId), zap.Bool("canPublish", !acct.enforceFlag))
 		_ = acct.submitObservation(pe)
 	}
 
@@ -264,11 +276,15 @@ func (acct *Accountant) SubmitObservation(msg *common.MessagePublication) (bool,
 	return !acct.enforceFlag, nil
 }
 
-// publishTransferAlreadyLocked publishes a pending transfer to the accountant channel and updates the timestamp. It assumes the caller holds the lock.
+// publishTransferAlreadyLocked publishes a pending transfer to the accountant channel and deletes it from the pending map. It assumes the caller holds the lock.
 func (acct *Accountant) publishTransferAlreadyLocked(pe *pendingEntry) {
 	if acct.enforceFlag {
-		acct.logger.Debug("acct: publishTransferAlreadyLocked: notifying the processor", zap.String("msgId", pe.msgId))
-		acct.msgChan <- pe.msg
+		select {
+		case acct.msgChan <- pe.msg:
+			acct.logger.Debug("published transfer to channel", zap.String("msgId", pe.msgId))
+		default:
+			acct.logger.Error("unable to publish transfer because the channel is full", zap.String("msgId", pe.msgId))
+		}
 	}
 
 	acct.deletePendingTransferAlreadyLocked(pe.msgId)
@@ -276,7 +292,6 @@ func (acct *Accountant) publishTransferAlreadyLocked(pe *pendingEntry) {
 
 // addPendingTransferAlreadyLocked adds a pending transfer to both the map and the database. It assumes the caller holds the lock.
 func (acct *Accountant) addPendingTransferAlreadyLocked(pe *pendingEntry) error {
-	acct.logger.Debug("acct: addPendingTransferAlreadyLocked", zap.String("msgId", pe.msgId))
 	pe.setUpdTime()
 	if err := acct.db.AcctStorePendingTransfer(pe.msg); err != nil {
 		return err
@@ -296,13 +311,13 @@ func (acct *Accountant) deletePendingTransfer(msgId string) {
 
 // deletePendingTransferAlreadyLocked deletes the transfer from both the map and the database. It assumes the caller holds the lock.
 func (acct *Accountant) deletePendingTransferAlreadyLocked(msgId string) {
-	acct.logger.Debug("acct: deletePendingTransfer", zap.String("msgId", msgId))
+	acct.logger.Debug("deletePendingTransfer", zap.String("msgId", msgId))
 	if _, exists := acct.pendingTransfers[msgId]; exists {
 		delete(acct.pendingTransfers, msgId)
 		transfersOutstanding.Set(float64(len(acct.pendingTransfers)))
 	}
 	if err := acct.db.AcctDeletePendingTransfer(msgId); err != nil {
-		acct.logger.Error("acct: failed to delete pending transfer from the db", zap.String("msgId", msgId), zap.Error(err))
+		acct.logger.Error("failed to delete pending transfer from the db", zap.String("msgId", msgId), zap.Error(err))
 		// Ignore this error and keep going.
 	}
 }
@@ -316,7 +331,7 @@ func (acct *Accountant) loadPendingTransfers() error {
 
 	for _, msg := range pendingTransfers {
 		msgId := msg.MessageIDString()
-		acct.logger.Info("acct: reloaded pending transfer", zap.String("msgID", msgId))
+		acct.logger.Info("reloaded pending transfer", zap.String("msgID", msgId))
 
 		digest := msg.CreateDigest()
 		pe := &pendingEntry{msg: msg, msgId: msgId, digest: digest}
@@ -326,9 +341,9 @@ func (acct *Accountant) loadPendingTransfers() error {
 
 	transfersOutstanding.Set(float64(len(acct.pendingTransfers)))
 	if len(acct.pendingTransfers) != 0 {
-		acct.logger.Info("acct: reloaded pending transfers", zap.Int("total", len(acct.pendingTransfers)))
+		acct.logger.Info("reloaded pending transfers", zap.Int("total", len(acct.pendingTransfers)))
 	} else {
-		acct.logger.Info("acct: no pending transfers to be reloaded")
+		acct.logger.Info("no pending transfers to be reloaded")
 	}
 
 	return nil
@@ -351,9 +366,9 @@ func (acct *Accountant) submitObservation(pe *pendingEntry) bool {
 
 	select {
 	case acct.subChan <- pe.msg:
-		acct.logger.Debug("acct: submitted observation to channel", zap.String("msgId", pe.msgId))
+		acct.logger.Debug("submitted observation to channel", zap.String("msgId", pe.msgId))
 	default:
-		acct.logger.Error("acct: unable to submit observation because the channel is full, will try next interval", zap.String("msgId", pe.msgId))
+		acct.logger.Error("unable to submit observation because the channel is full, will try next interval", zap.String("msgId", pe.msgId))
 		pe.state.submitPending = false
 	}
 
